@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 async def mikrotik_get_logs(
     ctx: Context,
     topics: Optional[str] = None,
-    action: Optional[str] = None,
     time_filter: Optional[str] = None,
     message_filter: Optional[str] = None,
     prefix_filter: Optional[str] = None,
@@ -19,11 +18,20 @@ async def mikrotik_get_logs(
     print_as: Literal["value", "detail", "terse"] = "value",
     device: Optional[str] = None
 ) -> str:
-    """Gets logs from the MikroTik device with optional topic, time, and message filters."""
-    await ctx.info(f"Getting logs with filters: topics={topics}, action={action}, time={time_filter}")
+    """Gets logs from the MikroTik device with optional topic, time, and message filters.
 
-    # Build the command
-    cmd = f"/log print {print_as}"
+    Notes:
+        time_filter: RouterOS duration e.g. "10m", "1h", "1d"
+    """
+    await ctx.info(f"Getting logs with filters: topics={topics}, time={time_filter}")
+
+    # Build the command; the RouterOS keyword is "as-value", not "value"
+    style = "as-value" if print_as == "value" else print_as
+    cmd = f"/log print {style}"
+
+    # "where" must be the last print argument, so follow goes before it
+    if follow:
+        cmd += " follow"
 
     # Add filters
     filters = []
@@ -37,9 +45,6 @@ async def mikrotik_get_logs(
         else:
             filters.append(topic_filter)
 
-    if action:
-        filters.append(f'action="{action}"')
-
     if message_filter:
         filters.append(f'message~"{message_filter}"')
 
@@ -47,22 +52,22 @@ async def mikrotik_get_logs(
         filters.append(f'message~"^{prefix_filter}"')
 
     if time_filter:
-        # Convert time filter to where clause
-        filters.append(f"time > ([:timestamp] - {time_filter})")
+        # ROS 7 stores log time as a string, so convert it before comparing
+        filters.append(f'(([:timestamp] + ([/system clock get gmt-offset] . "s")) - [:totime (time)]) < {time_filter}')
 
     if filters:
         cmd += " where " + " and ".join(filters)
-
-    if limit:
-        cmd += f" limit={limit}"
-
-    if follow:
-        cmd += " follow"
 
     result = await execute_mikrotik_command(cmd, ctx, device=device)
 
     if not result or result.strip() == "" or result.strip() == "no such item":
         return "No log entries found matching the criteria."
+
+    # print has no limit parameter; keep the newest (last) lines client-side
+    if limit:
+        lines = [line for line in result.splitlines() if line.strip()]
+        if len(lines) > limit:
+            result = "\n".join(lines[-limit:])
 
     return f"LOG ENTRIES:\n\n{result}"
 
