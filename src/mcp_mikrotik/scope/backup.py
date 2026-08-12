@@ -172,9 +172,21 @@ async def mikrotik_export_section(
 
     result = await execute_mikrotik_command(cmd, ctx, device=device)
 
-    # Check if export was successful
-    if not result.strip() or "failure:" not in result.lower():
-        # Get file details
+    # The export command outputs nothing on success, but errors like "syntax
+    # error" or "bad command name" lack a "failure:" marker — so verify success
+    # by confirming the file actually exists instead of parsing the output.
+    check_cmd = f'/file print count-only where name="{name}.rsc"'
+    count = await execute_mikrotik_command(check_cmd, ctx, device=device)
+
+    if not count.strip().isdigit() or int(count.strip()) == 0:
+        return f"Failed to export section: {result}"
+
+    # Read the exported content back so the tool returns the actual
+    # configuration, not just file metadata.
+    try:
+        content = await asyncio.to_thread(download_file_sync, f"{name}.rsc", device)
+    except Exception:
+        # SFTP unavailable — fall back to returning file metadata.
         file_cmd = f"/file print detail where name={name}.rsc"
         file_details = await execute_mikrotik_command(file_cmd, ctx, device=device)
 
@@ -182,8 +194,9 @@ async def mikrotik_export_section(
             return f"Section export created successfully:\n\n{file_details}"
         else:
             return f"Section export '{name}.rsc' created successfully."
-    else:
-        return f"Failed to export section: {result}"
+
+    text = content.decode("utf-8", errors="replace")
+    return f"Section export '{name}.rsc' created successfully:\n\n{text}"
 
 @mcp.tool(name="download_file", annotations=annotate(READ, "Download File"))
 async def mikrotik_download_file(
