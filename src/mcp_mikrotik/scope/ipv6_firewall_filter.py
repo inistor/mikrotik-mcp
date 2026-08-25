@@ -38,19 +38,23 @@ async def mikrotik_create_ipv6_filter_rule(
     """Creates an IPv6 firewall filter rule on the MikroTik device.
 
     Notes:
-        src_address/dst_address: IPv6 address or prefix e.g. "2001:db8::/64".
         protocol: IPv6 uses "icmpv6", not the IPv4 spelling "icmp".
-        jump_target: name of the chain to jump to; only used with action="jump".
-        connection_state: comma-separated e.g. "established,related,new,invalid"
-        src_address_type/dst_address_type: e.g. "unicast", "multicast", "local"
-        icmp_options: ICMPv6 type:code e.g. "128:0" for echo request
-        hop_limit: RouterOS hop-limit expression e.g. "equal:255"
-        headers: IPv6 extension header match e.g. "hop" or "!hop"
-        limit: RouterOS rate/burst string e.g. "10,5:packet" or "10/1s:packet"
-        tcp_flags: RouterOS flag expression e.g. "syn,!ack"
-        place_before: rule number or ID (*N) to insert before e.g. "0" or "*3"
+        jump_target: only used with action="jump".
     """
     await ctx.info(f"Creating IPv6 firewall filter rule: chain={chain}, action={action}")
+
+    has_match = any((
+        src_address, dst_address, src_port, dst_port, protocol,
+        in_interface, out_interface, connection_state,
+        src_address_list, dst_address_list, src_address_type, dst_address_type,
+        icmp_options, hop_limit, headers, limit, tcp_flags
+    ))
+    warning = "" if has_match else (
+        f"WARNING: this rule has no match conditions - it matches ALL traffic in the '{chain}' chain "
+        f"and applies action '{action}' to every packet. Verify this is intentional (e.g. a final drop-all rule).\n\n"
+    )
+    if not has_match:
+        await ctx.warning(f"Creating filter rule with no match conditions - it will match all traffic in chain '{chain}'")
 
     cmd = f"/ipv6 firewall filter add chain={chain} action={action}"
 
@@ -115,8 +119,8 @@ async def mikrotik_create_ipv6_filter_rule(
             f'/ipv6 firewall filter print detail where .id={rule_id}', ctx, device=device
         )
         if "chain=" in details:
-            return f"IPv6 firewall filter rule created successfully:\n\n{details}"
-        return f"IPv6 firewall filter rule created with ID: {rule_id}"
+            return f"{warning}IPv6 firewall filter rule created successfully:\n\n{details}"
+        return f"{warning}IPv6 firewall filter rule created with ID: {rule_id}"
 
     count = await execute_mikrotik_command(
         "/ipv6 firewall filter print count-only", ctx, device=device
@@ -126,9 +130,9 @@ async def mikrotik_create_ipv6_filter_rule(
             f"/ipv6 firewall filter print detail from={int(count.strip()) - 1}", ctx, device=device
         )
         if "chain=" in details:
-            return f"IPv6 firewall filter rule created successfully:\n\n{details}"
+            return f"{warning}IPv6 firewall filter rule created successfully:\n\n{details}"
 
-    return f"IPv6 firewall filter rule created in chain '{chain}'."
+    return f"{warning}IPv6 firewall filter rule created in chain '{chain}'."
 
 
 @mcp.tool(name="list_ipv6_filter_rules", annotations=annotate(READ, "List IPv6 Filter Rules"))
@@ -301,6 +305,15 @@ async def mikrotik_update_ipv6_filter_rule(
     if not updates:
         return "No updates specified."
 
+    # RouterOS answers a bad id with "no such item", which contains neither
+    # "failure:" nor "error" — so check the rule exists first, as remove and
+    # move do, and confirm afterwards on real content, as get does.
+    check = await execute_mikrotik_command(
+        f'/ipv6 firewall filter print count-only where .id={rule_id}', ctx, device=device
+    )
+    if check.strip() == "0":
+        return f"IPv6 firewall filter rule with ID '{rule_id}' not found."
+
     cmd = f'/ipv6 firewall filter set {rule_id} ' + " ".join(updates)
     result = await execute_mikrotik_command(cmd, ctx, device=device)
 
@@ -310,6 +323,8 @@ async def mikrotik_update_ipv6_filter_rule(
     details = await execute_mikrotik_command(
         f'/ipv6 firewall filter print detail where .id={rule_id}', ctx, device=device
     )
+    if "chain=" not in details:
+        return f"Failed to update IPv6 firewall filter rule: {result or details}"
 
     return f"IPv6 firewall filter rule updated successfully:\n\n{details}"
 

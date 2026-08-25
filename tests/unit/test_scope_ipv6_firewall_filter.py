@@ -9,6 +9,11 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _set_cmd(fake):
+    """The `set` command, ignoring the existence pre-check that precedes it."""
+    return next(c for c in fake.commands if " set " in c)
+
+
 # ---------------------------------------------------------------------------
 # create_ipv6_filter_rule — command construction
 # ---------------------------------------------------------------------------
@@ -271,7 +276,7 @@ def test_update_sets_and_clears(ctx, monkeypatch):
     _run(m.mikrotik_update_ipv6_filter_rule(
         ctx, rule_id="*1", protocol="icmpv6", src_address="",
     ))
-    cmd = fake.commands[0]
+    cmd = _set_cmd(fake)
     assert cmd.startswith("/ipv6 firewall filter set *1 ")
     assert "protocol=icmpv6" in cmd
     assert "!src-address" in cmd
@@ -290,7 +295,7 @@ def test_update_quotes_only_name_bearing_fields(ctx, monkeypatch):
         hop_limit="equal:255", tcp_flags="syn,!ack", limit="10,5:packet",
         dst_port="443", protocol="tcp",
     ))
-    cmd = fake.commands[0]
+    cmd = _set_cmd(fake)
     for quoted in ('in-interface="ether1"', 'src-address-list="trusted"',
                    'jump-target="chain-a"'):
         assert quoted in cmd
@@ -307,11 +312,11 @@ def test_enable_and_disable_wrappers(ctx, monkeypatch):
     monkeypatch.setattr(m, "execute_mikrotik_command", fake, raising=True)
 
     _run(m.mikrotik_disable_ipv6_filter_rule(ctx, rule_id="*1"))
-    assert "disabled=yes" in fake.commands[0]
+    assert "disabled=yes" in _set_cmd(fake)
 
     fake.commands.clear()
     _run(m.mikrotik_enable_ipv6_filter_rule(ctx, rule_id="*1"))
-    assert "disabled=no" in fake.commands[0]
+    assert "disabled=no" in _set_cmd(fake)
 
 
 def test_device_argument_is_forwarded(ctx, monkeypatch):
@@ -410,3 +415,90 @@ def test_move_missing_rule(ctx, monkeypatch):
 
     out = _run(m.mikrotik_move_ipv6_filter_rule(ctx, rule_id="*99", destination=1))
     assert "not found" in out
+
+# ---------------------------------------------------------------------------
+# review follow-ups: match-all warning (#111/#132) and update on a missing rule
+# ---------------------------------------------------------------------------
+
+def test_create_warns_when_no_match_conditions(ctx, monkeypatch):
+    from mcp_mikrotik.scope import ipv6_firewall_filter as m
+
+    fake = FakeExecutor()
+    monkeypatch.setattr(m, "execute_mikrotik_command", fake, raising=True)
+
+    out = _run(m.mikrotik_create_ipv6_filter_rule(ctx, chain="forward", action="drop"))
+    assert out.startswith("WARNING: this rule has no match conditions")
+    assert "'forward'" in out and "'drop'" in out
+    ctx.warning.assert_awaited()
+
+
+def test_create_does_not_warn_when_a_match_condition_is_present(ctx, monkeypatch):
+    from mcp_mikrotik.scope import ipv6_firewall_filter as m
+
+    fake = FakeExecutor()
+    monkeypatch.setattr(m, "execute_mikrotik_command", fake, raising=True)
+
+    out = _run(m.mikrotik_create_ipv6_filter_rule(
+        ctx, chain="forward", action="drop", protocol="icmpv6"))
+    assert "WARNING" not in out
+
+
+def test_create_ipv6_only_match_field_counts_as_a_condition(ctx, monkeypatch):
+    """hop_limit et al are real matches; they must suppress the warning."""
+    from mcp_mikrotik.scope import ipv6_firewall_filter as m
+
+    fake = FakeExecutor()
+    monkeypatch.setattr(m, "execute_mikrotik_command", fake, raising=True)
+
+    out = _run(m.mikrotik_create_ipv6_filter_rule(
+        ctx, chain="input", action="drop", hop_limit="equal:255"))
+    assert "WARNING" not in out
+
+
+def test_update_missing_rule_is_not_reported_as_success(ctx, monkeypatch):
+    """RouterOS says "no such item (4)" — neither "failure:" nor "error"."""
+    from mcp_mikrotik.scope import ipv6_firewall_filter as m
+
+    async def absent(command, _ctx, device=None):
+        if "count-only" in command:
+            return "0"
+        return "no such item (4)"
+
+    monkeypatch.setattr(m, "execute_mikrotik_command", absent, raising=True)
+
+    out = _run(m.mikrotik_update_ipv6_filter_rule(ctx, rule_id="*99", disabled=True))
+    assert "not found" in out
+    assert "updated successfully" not in out
+
+
+def test_disable_on_missing_rule_does_not_claim_success(ctx, monkeypatch):
+    """enable/disable delegate to update, so they inherit the guard."""
+    from mcp_mikrotik.scope import ipv6_firewall_filter as m
+
+    async def absent(command, _ctx, device=None):
+        if "count-only" in command:
+            return "0"
+        return "no such item (4)"
+
+    monkeypatch.setattr(m, "execute_mikrotik_command", absent, raising=True)
+
+    out = _run(m.mikrotik_disable_ipv6_filter_rule(ctx, rule_id="*99"))
+    assert "not found" in out
+    assert "successfully" not in out
+
+
+def test_update_requires_real_content_before_claiming_success(ctx, monkeypatch):
+    """A legend-only details print must not read as a successful update."""
+    from mcp_mikrotik.scope import ipv6_firewall_filter as m
+
+    async def legend(command, _ctx, device=None):
+        if "count-only" in command:
+            return "1"
+        if "print detail" in command:
+            return "Flags: X - disabled, I - invalid; D - dynamic"
+        return ""
+
+    monkeypatch.setattr(m, "execute_mikrotik_command", legend, raising=True)
+
+    out = _run(m.mikrotik_update_ipv6_filter_rule(ctx, rule_id="*1", disabled=True))
+    assert out.startswith("Failed to update IPv6 firewall filter rule:")
